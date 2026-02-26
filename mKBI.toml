@@ -1,0 +1,24 @@
+[api]
+key = "YOUR_API_KEY_HERE"
+base_url = "https://openrouter.ai/api/v1"
+
+[history]
+path = "mKBI_history.json"
+
+[service]
+model = "openrouter/auto"
+hot_load = true
+
+[interpreter]
+temperature = 0.7
+top_p = 1.0
+context_length = 4000
+fab_driver = true
+
+[fabricator]
+temperature = 1.0
+top_p = 0.4
+context_length = 16000
+
+[execution]
+timeout = 30          # seconds before the subprocess is killed
