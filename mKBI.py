@@ -10,14 +10,21 @@ API key resolution order:
   3. .env file (LLM_API_KEY)
   4. Bail with error
 
-Conversation history is loaded from a JSON file specified by
-config [history] path. The file must contain a top-level object
-with "interpreter" and/or "fabricator" keys, each holding a list
-of {role, content} messages. These are prepended to every call
-made by the respective method.
+Skills are loaded from the directory specified by config [skills] dir.
+Each .json file in that directory is a named skill (filename stem).
+Skills must have the structure:
+  {
+    "meta": {
+      "executor":        "<bash|python3|...>",
+      "file_extension":  "<.sh|.py|...>",
+      "static_analysis": "<shellcheck|null>"
+    },
+    "interpreter": [ {role, content}, ... ],
+    "fabricator":  [ {role, content}, ... ]
+  }
 
 execute_task() runs the full dual-model chain:
-  user request -> Interpreter -> Fabricator -> shellcheck -> subprocess
+  user request -> Interpreter -> Fabricator -> static analysis -> subprocess
 """
 
 import json
@@ -35,6 +42,10 @@ import openai
 _PLACEHOLDER = "YOUR_API_KEY_HERE"
 
 
+# ---------------------------------------------------------------------------
+# Config / key / client
+# ---------------------------------------------------------------------------
+
 def load_config(config_path: str = "mKBI.toml") -> dict:
     path = Path(config_path)
     if not path.exists():
@@ -45,18 +56,14 @@ def load_config(config_path: str = "mKBI.toml") -> dict:
 
 
 def resolve_api_key(config: dict) -> str:
-    # 1. Config file
     key = config.get("api", {}).get("key", "")
     if key and key != _PLACEHOLDER:
         return key
-
-    # 2. Environment / .env
     load_dotenv()
     key = os.getenv("LLM_API_KEY", "")
     if key:
         print("[mKBI] LLM_API_KEY found in environment.")
         return key
-
     print("[mKBI] No valid API key found. Set LLM_API_KEY in environment or provide it in the config file.")
     sys.exit(1)
 
@@ -68,102 +75,143 @@ def make_client(config: dict) -> openai.OpenAI:
     )
 
 
-def load_history(config: dict) -> dict:
+# ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+
+def load_skills(config: dict) -> dict[str, dict]:
     """
-    Load conversation history from the JSON file specified in [history] path.
-    Returns a dict with "interpreter" and "fabricator" keys (each a list of
-    messages, defaulting to empty list if the key is absent).
-    If no history path is configured or the file is missing, returns empty lists.
+    Scan the skills directory and load every .json file as a named skill.
+    Returns a dict mapping skill name -> skill data dict.
+    Each skill dict has keys: meta, interpreter, fabricator.
     """
-    history_path = config.get("history", {}).get("path", "")
-    if not history_path:
-        return {"interpreter": [], "fabricator": []}
+    skills_dir = Path(config.get("skills", {}).get("dir", "skills"))
+    if not skills_dir.exists():
+        print(f"[mKBI] Skills directory not found: {skills_dir}")
+        sys.exit(1)
 
-    path = Path(history_path)
-    if not path.exists():
-        print(f"[mKBI] History file not found: {history_path} — starting with empty history.")
-        return {"interpreter": [], "fabricator": []}
+    skills: dict[str, dict] = {}
+    for skill_file in sorted(skills_dir.glob("*.json")):
+        name = skill_file.stem
+        with open(skill_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        skills[name] = {
+            "meta":        data.get("meta", {}),
+            "interpreter": data.get("interpreter", []),
+            "fabricator":  data.get("fabricator", []),
+        }
+        print(f"[mKBI] Loaded skill: {name} (executor={data.get('meta', {}).get('executor', 'unknown')})")
 
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    if not skills:
+        print(f"[mKBI] No skill files found in {skills_dir}")
+        sys.exit(1)
 
-    return {
-        "interpreter": data.get("interpreter", []),
-        "fabricator": data.get("fabricator", []),
-    }
+    return skills
 
 
+# ---------------------------------------------------------------------------
+# Static analysis
+# ---------------------------------------------------------------------------
 
-def _run_shellcheck(script_path: str) -> tuple[bool, str]:
-    """
-    Run shellcheck against script_path.
-    Returns (passed: bool, output: str).
-    If shellcheck is not installed, returns (True, warning_message) so execution
-    can still proceed — the caller should surface the warning.
-    """
-    if not shutil.which("shellcheck"):
-        return True, "[mKBI] shellcheck not found on PATH — skipping static analysis."
+_STATIC_ANALYSIS_CMDS: dict[str, list[str]] = {
+    "shellcheck": ["shellcheck", "{script}"],
+}
 
-    result = subprocess.run(
-        ["shellcheck", script_path],
-        capture_output=True,
-        text=True,
-    )
+
+def _run_static_analysis(tool: str | None, script_path: str) -> tuple[bool, str]:
+    if not tool:
+        return True, ""
+
+    cmd_template = _STATIC_ANALYSIS_CMDS.get(tool)
+    if cmd_template is None:
+        return True, f"[mKBI] Unknown static analysis tool '{tool}' — skipping."
+
+    cmd = [part.replace("{script}", script_path) for part in cmd_template]
+    binary = cmd[0]
+
+    if not shutil.which(binary):
+        return True, f"[mKBI] {binary} not found on PATH — skipping static analysis."
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
     passed = result.returncode == 0
     output = (result.stdout + result.stderr).strip()
     return passed, output
 
 
-def _execute_script(script_path: str, timeout: int) -> dict:
-    """
-    Execute a shell script in a separate process group.
-    Returns a dict with keys: stdout, stderr, returncode, timed_out.
-    On timeout the process group is killed before returning.
-    """
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+_EXECUTOR_CMDS: dict[str, list[str]] = {
+    "bash":    ["bash",    "{script}"],
+    "python3": ["python3", "{script}"],
+    "python":  ["python",  "{script}"],
+    "node":    ["node",    "{script}"],
+    "ruby":    ["ruby",    "{script}"],
+    "perl":    ["perl",    "{script}"],
+}
+
+
+def _execute_script(executor: str, script_path: str, timeout: int) -> dict:
+    cmd_template = _EXECUTOR_CMDS.get(executor)
+    if cmd_template is None:
+        return {
+            "stdout": "",
+            "stderr": f"Unknown executor: {executor}",
+            "returncode": -1,
+            "timed_out": False,
+        }
+
+    cmd = [part.replace("{script}", script_path) for part in cmd_template]
+
     try:
         result = subprocess.run(
-            ["bash", script_path],
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
-            start_new_session=True,   # own process group — clean kill on timeout
+            start_new_session=True,
         )
         return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout":     result.stdout,
+            "stderr":     result.stderr,
             "returncode": result.returncode,
-            "timed_out": False,
+            "timed_out":  False,
         }
     except subprocess.TimeoutExpired as e:
-        # process group is automatically killed by Python after TimeoutExpired
         return {
-            "stdout": (e.stdout or b"").decode(errors="replace"),
-            "stderr": (e.stderr or b"").decode(errors="replace"),
+            "stdout":     (e.stdout or b"").decode(errors="replace"),
+            "stderr":     (e.stderr or b"").decode(errors="replace"),
             "returncode": None,
-            "timed_out": True,
+            "timed_out":  True,
         }
 
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
 
 class LLMService:
     """
     Unified service class. Loads all parameters from a TOML config.
 
     Public methods:
-      create_chat(messages)  — Interpreter: problem-solving call
-      fabricate(messages)    — Fabricator: code-hardening call
-      execute_task(request)  — Full chain: Interpreter -> Fabricator -> shellcheck -> exec
+      list_skills()                        — names of registered skills
+      reload_skills()                      — rescan skills directory
+      create_chat(messages, skill)         — Interpreter call for a skill
+      fabricate(messages, skill)           — Fabricator call for a skill
+      execute_task(request, skill, ...)    — Full chain for a skill
     """
 
     def __init__(self, config_path: str = "mKBI.toml"):
         self.config = load_config(config_path)
         self.model = self.config["service"]["model"]
-        self.hot_load = self.config["service"]["hot_load"]
+        self.default_skill = self.config["service"].get("default_skill", "bash")
 
         interp = self.config["interpreter"]
         self.interp_temperature = interp["temperature"]
         self.interp_top_p = interp["top_p"]
         self.interp_context_length = interp["context_length"]
-        self.fab_driver = interp["fab_driver"]
 
         fab = self.config["fabricator"]
         self.fab_temperature = fab["temperature"]
@@ -173,13 +221,40 @@ class LLMService:
         exec_cfg = self.config.get("execution", {})
         self.exec_timeout = exec_cfg.get("timeout", 30)
 
-        history = load_history(self.config)
-        self.interp_history: list = history["interpreter"]
-        self.fab_history: list = history["fabricator"]
+        # API client is created once at init and kept in memory
+        self.client = make_client(self.config)
+
+        self.skills = load_skills(self.config)
+
+    # ------------------------------------------------------------------
+    # Skills management
+    # ------------------------------------------------------------------
+
+    def list_skills(self) -> list[dict]:
+        return [
+            {
+                "name":      name,
+                "executor":  skill["meta"].get("executor", "unknown"),
+                "analysis":  skill["meta"].get("static_analysis"),
+            }
+            for name, skill in self.skills.items()
+        ]
+
+    def reload_skills(self) -> list[dict]:
+        self.skills = load_skills(self.config)
+        return self.list_skills()
+
+    def _get_skill(self, skill_name: str) -> dict:
+        if skill_name not in self.skills:
+            raise ValueError(f"Unknown skill: '{skill_name}'. Available: {list(self.skills)}")
+        return self.skills[skill_name]
+
+    # ------------------------------------------------------------------
+    # LLM calls
+    # ------------------------------------------------------------------
 
     def _call(self, messages: list, temperature: float, top_p: float) -> str:
-        client = make_client(self.config)
-        response = client.chat.completions.create(
+        response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=temperature,
@@ -188,104 +263,109 @@ class LLMService:
         )
         try:
             return response.choices[0].message.content
-        except KeyError:
+        except (KeyError, IndexError):
             return ""
         except Exception as e:
             print(e)
             sys.exit(1)
 
-    def create_chat(self, messages: list) -> str:
-        full_messages = self.interp_history + messages
-        return self._call(full_messages, self.interp_temperature, self.interp_top_p)
+    def create_chat(self, messages: list, skill: str | None = None) -> str:
+        skill_name = skill or self.default_skill
+        history = self._get_skill(skill_name)["interpreter"]
+        return self._call(history + messages, self.interp_temperature, self.interp_top_p)
 
-    def fabricate(self, messages: list) -> str:
-        full_messages = self.fab_history + messages
-        return self._call(full_messages, self.fab_temperature, self.fab_top_p)
+    def fabricate(self, messages: list, skill: str | None = None) -> str:
+        skill_name = skill or self.default_skill
+        history = self._get_skill(skill_name)["fabricator"]
+        return self._call(history + messages, self.fab_temperature, self.fab_top_p)
 
-    def execute_task(self, user_request: str, output_only: bool = False) -> dict | str:
+    # ------------------------------------------------------------------
+    # Full execution chain
+    # ------------------------------------------------------------------
+
+    def execute_task(
+        self,
+        user_request: str,
+        skill: str | None = None,
+        output_only: bool = False,
+    ) -> dict | str:
         """
         Run the full dual-model execution chain for a user request.
 
         Stages:
-          1. Interpreter  — reasons about the request, produces a bash solution
-          2. Fabricator   — receives "<request> [KCR] <interpreter output>", validates
-                            and formats the code into clean, executable bash
-          3. shellcheck   — static analysis; aborts execution if errors are found
-          4. subprocess   — executes the script in a separate process group
+          1. Interpreter  — reasons about the request, produces code
+          2. Fabricator   — validates and formats the code
+          3. Static analysis — aborts if errors found (tool from skill meta)
+          4. subprocess   — executes via the skill's executor
 
-        If output_only=True, returns only the stdout of the execution (or the
-        error string if the chain was aborted before reaching that stage).
-
-        Otherwise returns a dict with keys:
-          interpreter_response  str
-          fabricator_response   str
-          script                str
-          shellcheck_passed     bool
-          shellcheck_output     str
-          execution             dict | None  (stdout, stderr, returncode, timed_out)
-          error                 str | None   (set if the chain was aborted early)
+        Returns a result dict, or stdout string if output_only=True.
         """
+        skill_name = skill or self.default_skill
+        skill_data = self._get_skill(skill_name)
+        meta = skill_data["meta"]
+        executor = meta.get("executor", "bash")
+        extension = meta.get("file_extension", ".sh")
+        analysis_tool = meta.get("static_analysis")
+
         result = {
+            "skill":                skill_name,
             "interpreter_response": "",
-            "fabricator_response": "",
-            "script": "",
-            "shellcheck_passed": False,
-            "shellcheck_output": "",
-            "execution": None,
-            "error": None,
+            "fabricator_response":  "",
+            "script":               "",
+            "shellcheck_passed":    False,
+            "shellcheck_output":    "",
+            "execution":            None,
+            "error":                None,
         }
 
-        # --- Stage 1: Interpreter ---
-        print(f"[mKBI] Interpreter processing request...")
-        interp_response = self.create_chat([
-            {"role": "user", "content": user_request}
-        ])
+        # Stage 1: Interpreter
+        print(f"[mKBI] Interpreter processing request (skill={skill_name})...")
+        interp_response = self.create_chat(
+            [{"role": "user", "content": user_request}],
+            skill=skill_name,
+        )
         result["interpreter_response"] = interp_response
         print(f"[mKBI] Interpreter response:\n{interp_response}\n")
 
-        # --- Stage 2: Fabricator ---
-        # Format: <user request> [KCR] <interpreter response>
+        # Stage 2: Fabricator
         kcr_message = f"{user_request} [KCR] {interp_response}"
-#        print(f"[mKBI] Fabricator processing KCR...")
-        fab_response = self.fabricate([
-            {"role": "user", "content": kcr_message}
-        ])
+        fab_response = self.fabricate(
+            [{"role": "user", "content": kcr_message}],
+            skill=skill_name,
+        )
         result["fabricator_response"] = fab_response
+        result["script"] = fab_response
 
-        script = fab_response
-        result["script"] = script
-#        print(f"[mKBI] Fabricator script:\n{script}\n")
-
-        if not script:
+        if not fab_response:
             result["error"] = "Fabricator returned an empty script."
-            return result
+            return result["error"] if output_only else result
 
-        # --- Stage 3: shellcheck ---
+        # Stage 3: Static analysis
         with tempfile.NamedTemporaryFile(
             mode="w",
-            suffix=".sh",
+            suffix=extension,
             delete=False,
             encoding="utf-8",
         ) as tmp:
-            tmp.write(script)
+            tmp.write(fab_response)
             tmp_path = tmp.name
 
         try:
-            sc_passed, sc_output = _run_shellcheck(tmp_path)
+            sc_passed, sc_output = _run_static_analysis(analysis_tool, tmp_path)
             result["shellcheck_passed"] = sc_passed
             result["shellcheck_output"] = sc_output
 
             if not sc_passed:
-                print(f"[mKBI] shellcheck failed:\n{sc_output}")
-                result["error"] = "shellcheck reported errors — execution aborted."
-                return result
+                print(f"[mKBI] Static analysis failed:\n{sc_output}")
+                result["error"] = f"{analysis_tool} reported errors — execution aborted."
+                return result["error"] if output_only else result
 
             if sc_output:
-                print(f"[mKBI] shellcheck: {sc_output}")
+                print(f"[mKBI] Static analysis: {sc_output}")
 
-            # --- Stage 4: Execute ---
-            print(f"[mKBI] Executing script (timeout={self.exec_timeout}s)...")
-            exec_result = _execute_script(tmp_path, self.exec_timeout)
+            # Stage 4: Execute
+            print(f"[mKBI] Executing script (executor={executor}, timeout={self.exec_timeout}s)...")
+            exec_result = _execute_script(executor, tmp_path, self.exec_timeout)
             result["execution"] = exec_result
 
             if exec_result["timed_out"]:
@@ -306,6 +386,10 @@ class LLMService:
         return result
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import pprint
 
@@ -314,11 +398,17 @@ if __name__ == "__main__":
     if output_only:
         args = [a for a in args if a != "--output-only"]
 
-    request = " ".join(args) if args else "Open firefox to redddit pls"
+    skill_arg = None
+    if "--skill" in args:
+        idx = args.index("--skill")
+        skill_arg = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
+    request = " ".join(args) if args else "Open firefox to reddit pls"
 
     print(f"[mKBI] Task: {request}\n")
     service = LLMService()
-    outcome = service.execute_task(request, output_only=output_only)
+    outcome = service.execute_task(request, skill=skill_arg, output_only=output_only)
 
     if output_only:
         print(outcome)
